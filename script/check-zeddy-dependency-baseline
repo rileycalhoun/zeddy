@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repository_root=$(git rev-parse --show-toplevel)
+cd "$repository_root"
+
+baseline_commit=2551721adb5b5187bc27cfae0fbe47f0ed4c5397
+expected_manifest_count=262
+expected_manifest_fingerprint=61b92a36f19c7da9e0930e6e35979ceab24d7963
+expected_lockfile_sha256=4db815cc36ebff234fce8c04ec1d5230cca613a907602af217bcca1d2d6ae331
+
+if ! git cat-file -e "${baseline_commit}^{commit}" 2>/dev/null; then
+    echo "Unable to verify the Zeddy dependency baseline: commit $baseline_commit is unavailable." >&2
+    exit 1
+fi
+
+if ! git diff --quiet "$baseline_commit" -- Cargo.toml Cargo.lock ':(glob)**/Cargo.toml'; then
+    echo "Zeddy dependency baseline violation: protected dependency files differ from $baseline_commit." >&2
+    git diff --name-only "$baseline_commit" -- Cargo.toml Cargo.lock ':(glob)**/Cargo.toml' >&2
+    exit 1
+fi
+
+working_tree_dependency_changes=$(git status --porcelain=v1 --untracked-files=all -- Cargo.toml Cargo.lock ':(glob)**/Cargo.toml')
+if [[ -n "$working_tree_dependency_changes" ]]; then
+    echo "Zeddy dependency baseline violation: the working tree contains protected dependency changes." >&2
+    printf '%s\n' "$working_tree_dependency_changes" >&2
+    exit 1
+fi
+
+manifest_paths=()
+while IFS= read -r manifest_path; do
+    manifest_paths+=("$manifest_path")
+done < <(git ls-files -- 'Cargo.toml' '**/Cargo.toml')
+
+actual_manifest_count=${#manifest_paths[@]}
+if [[ "$actual_manifest_count" -ne "$expected_manifest_count" ]]; then
+    echo "Zeddy dependency baseline violation: expected $expected_manifest_count Cargo.toml files, found $actual_manifest_count." >&2
+    exit 1
+fi
+
+actual_manifest_fingerprint=$(
+    for manifest_path in "${manifest_paths[@]}"; do
+        printf '%s\t%s\n' "$(git hash-object "$manifest_path")" "$manifest_path"
+    done | LC_ALL=C sort | git hash-object --stdin
+)
+
+if [[ "$actual_manifest_fingerprint" != "$expected_manifest_fingerprint" ]]; then
+    echo "Zeddy dependency baseline violation: one or more Cargo.toml files changed." >&2
+    echo "Expected manifest fingerprint: $expected_manifest_fingerprint" >&2
+    echo "Actual manifest fingerprint:   $actual_manifest_fingerprint" >&2
+    exit 1
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+    actual_lockfile_sha256=$(sha256sum Cargo.lock | awk '{ print $1 }')
+elif command -v shasum >/dev/null 2>&1; then
+    actual_lockfile_sha256=$(shasum -a 256 Cargo.lock | awk '{ print $1 }')
+else
+    echo "Unable to verify Cargo.lock: sha256sum or shasum is required." >&2
+    exit 1
+fi
+
+if [[ "$actual_lockfile_sha256" != "$expected_lockfile_sha256" ]]; then
+    echo "Zeddy dependency baseline violation: Cargo.lock changed." >&2
+    echo "Expected Cargo.lock SHA-256: $expected_lockfile_sha256" >&2
+    echo "Actual Cargo.lock SHA-256:   $actual_lockfile_sha256" >&2
+    exit 1
+fi
+
+if ! cargo metadata --locked --offline --no-deps --format-version 1 >/dev/null; then
+    echo "Zeddy dependency baseline violation: locked offline Cargo metadata failed." >&2
+    exit 1
+fi
+
+echo "Zeddy dependency baseline verified: $actual_manifest_count manifests and Cargo.lock are unchanged."
